@@ -165,6 +165,7 @@ const CheckoutPage: React.FC = () => {
       throw error;
     }
   };
+
   const handleRazorpayPayment = async () => {
     console.log('[Checkout] Starting Razorpay payment process');
     
@@ -194,22 +195,46 @@ const CheckoutPage: React.FC = () => {
         name: 'RegionalMart',
         description: 'Order Payment',
         prefill: {
-          name: `${userProfile.first_name} ${userProfile.last_name}`,
-          email: userProfile.email,
-          contact: userProfile.mobile || ''
+          name: `${userProfile?.first_name} ${userProfile?.last_name}`,
+          email: userProfile?.email || '',
+          contact: userProfile?.mobile || ''
         },
-        onSuccess: async () => {
-          console.log('[Checkout] Payment successful, clearing cart and redirecting');
-          await clearCart();
-          // Small delay to ensure order is updated
-          setTimeout(() => {
-          navigate(`/order-success/${orderId}`);
-          }, 1000);
+
+        onSuccess: async (response) => {
+          console.log('[Checkout] Payment successful:', response);
+
+          const paymentId = response?.razorpay_payment_id;
+
+          if (!paymentId) {
+            alert('Payment verification failed.');
+            return;
+          }
+
+          try {
+            await OrderService.markOrderPaid(orderId, paymentId);
+
+            await clearCart();
+
+            navigate(`/order-success/${orderId}`);
+
+          } catch (error) {
+            console.error('[Checkout] Order update failed', error);
+            alert('Payment successful but order update failed. Contact support.');
+          }
         },
+
         onError: async (error) => {
           console.error('[Checkout] Payment failed:', error);
+
+          try {
+            await OrderService.markOrderFailed(orderId);
+          } catch (err) {
+            console.error('Failed to mark order as failed', err);
+          }
+
           alert('Payment failed. Please try again.');
         },
+
         onDismiss: () => {
           console.log('[Checkout] Payment dismissed by user');
           setProcessingOrder(false);
@@ -255,12 +280,12 @@ const CheckoutPage: React.FC = () => {
 
       // Small delay to ensure order is updated
       setTimeout(() => {
-      // Redirect to success page
-      navigate(`/order-success/${orderId}`);
+        // Redirect to success page
+        navigate(`/order-success/${orderId}`);
       }, 500);
     } catch (error) {
       console.error('[Checkout] Error placing COD order:', error);
-      alert('Failed to place order. Please try again.');
+      alert('Something went wrong, but your order may already be placed. Check orders page.');
     } finally {
       setLoading(false);
       setProcessingOrder(false);
@@ -279,6 +304,7 @@ const CheckoutPage: React.FC = () => {
       console.log('[Checkout] Order already processing');
       return;
     }
+    
     if (paymentMethod === 'razorpay') {
       handleRazorpayPayment();
     } else {
