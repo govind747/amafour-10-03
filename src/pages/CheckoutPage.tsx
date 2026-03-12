@@ -175,132 +175,190 @@ const CheckoutPage: React.FC = () => {
       setLoading(true);
       setProcessingOrder(true);
 
-      // 1️⃣ Create order in DB
-      const orderId = await createOrder();
-      if (!orderId) throw new Error("Order creation failed");
+      if (!userProfile || !selectedAddress) {
+        throw new Error('Missing user profile or delivery address');
+      }
 
-      // 2️⃣ Add items
-      await addOrderItems(orderId);
+      if (!(window as any).Razorpay) {
+        alert("Razorpay SDK not loaded. Please refresh the page.");
+        return;
+      }
 
-      // 3️⃣ Create Razorpay order
+      // Generate idempotency key for replay protection
+      const idempotencyKey = crypto.randomUUID();
+      console.log('[Checkout] Idempotency key:', idempotencyKey);
+
+      // 1️⃣ Create Razorpay order with idempotency key
       const { data, error } = await supabase.functions.invoke(
         "create-razorpay-order",
         {
           body: {
-            amount: total * 100,
-            receipt: orderId
+            cartItems: cartItems.map(item => ({
+              variant_id: item.variant_id,
+              quantity: item.quantity,
+              price: item.price_at_time
+            })),
+            userId: userProfile.id,
+            addressId: selectedAddress.id,
+            shippingMethod: 'standard',
+            idempotencyKey, // Send to server
+            timestamp: Date.now()
           }
         }
       );
 
-      if (error || !data?.id) {
+      if (error || !data?.razorpayOrderId) {
         throw new Error("Failed to create Razorpay order");
       }
 
-      const razorpayOrderId = data.id;
+      const { razorpayOrderId, amount, currency, orderReference, expiresAt } = data;
 
-      // 4️⃣ Save Razorpay order ID
-      await supabase
-        .from("orders")
-        .update({ razorpay_order_id: razorpayOrderId })
-        .eq("id", orderId);
+      // Store in session storage for recovery
+      sessionStorage.setItem('current_order', JSON.stringify({
+        orderReference,
+        razorpayOrderId,
+        amount,
+        expiresAt,
+        idempotencyKey
+      }));
 
-      console.log("[Checkout] Razorpay order:", razorpayOrderId);
-
-      // 5️⃣ Open checkout
-      await PaymentService.openRazorpayCheckout({
+      // 2️⃣ Configure Razorpay options with retry logic
+      const options = {
         key: import.meta.env.VITE_RAZORPAY_KEY_ID,
-
-        orderId: razorpayOrderId,
-        amount: total * 100,
-        currency: "INR",
-
+        amount: amount,
+        currency: currency,
         name: "RegionalMart",
-        description: "Order Payment",
-
-        prefill: {
-          name: `${userProfile?.first_name} ${userProfile?.last_name}`,
-          email: userProfile?.email || "",
-          contact: userProfile?.mobile || ""
+        description: `Order #${orderReference}`,
+        order_id: razorpayOrderId,
+        
+        // ✅ Retry configuration
+        retry: {
+          enabled: true,
+          max_count: 3
         },
 
-        onSuccess: async (response) => {
-          console.log("[Checkout] Payment success", response);
-
-          if (
-            !response?.razorpay_payment_id ||
-            !response?.razorpay_order_id ||
-            !response?.razorpay_signature
-          ) {
-            alert("Payment verification failed.");
-            return;
-          }
-
+        handler: async (response: any) => {
+          console.log('[Checkout] Payment successful:', response);
+          
           try {
-            // Verify payment
-            const verify = await supabase.functions.invoke(
+            // Show loading state
+            setProcessingOrder(true);
+
+            // 3️⃣ Verify payment with idempotency
+            const { data: verifyData, error: verifyError } = await supabase.functions.invoke(
               "verify-razorpay-payment",
               {
                 body: {
                   razorpay_payment_id: response.razorpay_payment_id,
                   razorpay_order_id: response.razorpay_order_id,
                   razorpay_signature: response.razorpay_signature,
-                  order_id: orderId
+                  orderReference: orderReference,
+                  idempotencyKey: idempotencyKey // Reuse same key
                 }
               }
             );
 
-            if (verify.error) {
-              throw new Error("Verification failed");
+            if (verifyError || !verifyData?.success) {
+              // Check if order was actually created (maybe by webhook)
+              const { data: existingOrder } = await supabase
+                .from('orders')
+                .select('id, order_reference')
+                .eq('order_reference', orderReference)
+                .single();
+
+              if (existingOrder) {
+                console.log('[Checkout] Order already created by webhook');
+                await clearCart();
+                navigate(`/order-success/${orderReference}`);
+                return;
+              }
+
+              throw new Error("Payment verification failed");
             }
 
-            // Update order
-            await supabase
-            .from("orders")
-            .update<any>({
-              razorpay_payment_id: response.razorpay_payment_id,
-              razorpay_signature: response.razorpay_signature,
-              payment_status: "paid",
-              order_status: "confirmed"
-            })
-              .eq("id", orderId)
-              .eq("payment_status", "pending");
-
+            // 4️⃣ Clear cart and redirect
             await clearCart();
-
-            navigate(`/order-success/${orderId}`);
-
+            sessionStorage.removeItem('current_order');
+            navigate(`/order-success/${orderReference}`);
+            
           } catch (err) {
-            console.error("Order update failed", err);
-            alert("Payment successful but verification failed.");
+            console.error("[Checkout] Post-payment error:", err);
+            
+            // Check order status via API
+            const { data: statusData } = await supabase.functions.invoke(
+              "check-order-status",
+              {
+                body: { orderReference }
+              }
+            );
+
+            if (statusData?.orderExists) {
+              // Order exists (webhook handled it)
+              await clearCart();
+              navigate(`/order-success/${orderReference}`);
+            } else {
+              alert("Payment successful but order confirmation delayed. We'll notify you via email.");
+            }
           }
         },
 
-        onError: async (error) => {
-          console.error("[Checkout] Payment failed:", error);
-
-          try {
-            await OrderService.markOrderFailed(orderId);
-          } catch (err) {
-            console.error("Failed to mark order failed", err);
+        modal: {
+          ondismiss: () => {
+            console.log('[Checkout] Payment modal dismissed');
+            setProcessingOrder(false);
+            
+            // Check if we need to cleanup
+            checkPendingOrder(orderReference);
           }
-
-          alert("Payment failed. Try again.");
-        },
-
-        onDismiss: () => {
-          console.log("[Checkout] Razorpay closed");
-          setProcessingOrder(false);
         }
+      };
+
+      const razorpay = new (window as any).Razorpay(options);
+      
+      razorpay.on('payment.failed', (response: any) => {
+        console.error('[Checkout] Payment failed:', response.error);
+        handlePaymentFailure(response, orderReference, idempotencyKey);
       });
+      
+      razorpay.open();
 
     } catch (error) {
       console.error("[Checkout] Payment error:", error);
-      alert("Payment could not be processed.");
+      alert("Payment could not be processed. Please try again.");
     } finally {
       setLoading(false);
-      setProcessingOrder(false);
     }
+  };
+
+  // Helper function to check pending orders
+  const checkPendingOrder = async (orderReference: string) => {
+    try {
+      const { data } = await supabase.functions.invoke(
+        "check-order-status",
+        { body: { orderReference } }
+      );
+
+      if (data?.orderExists) {
+        // Order was created (maybe by webhook after dismiss)
+        await clearCart();
+        navigate(`/order-success/${orderReference}`);
+      }
+    } catch (error) {
+      console.error("Error checking order:", error);
+    }
+  };
+
+  // Handle payment failure with replay protection
+  const handlePaymentFailure = async (response: any, orderReference: string, idempotencyKey: string) => {
+    await supabase.functions.invoke("handle-payment-failure", {
+      body: {
+        orderReference,
+        razorpay_payment_id: response.error.metadata?.payment_id,
+        error: response.error.description,
+        idempotencyKey,
+        timestamp: Date.now()
+      }
+    });
   };
 
   const handleCashOnDelivery = async () => {
