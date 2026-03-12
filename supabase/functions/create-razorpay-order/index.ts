@@ -1,5 +1,3 @@
-/// <reference types="https://deno.land/x/deno@v1.40.0/types.d.ts" />
-// 
 import Razorpay from "npm:razorpay";
 
 const corsHeaders = {
@@ -11,6 +9,7 @@ const corsHeaders = {
 
 Deno.serve(async (req) => {
 
+  // handle preflight
   if (req.method === "OPTIONS") {
     return new Response("ok", { headers: corsHeaders });
   }
@@ -20,14 +19,14 @@ Deno.serve(async (req) => {
     const { amount, receipt } = await req.json();
 
     const razorpay = new Razorpay({
-      key_id: Deno.env.get("VITE_RAZORPAY_KEY_ID"),
-      key_secret: Deno.env.get("VITE_RAZORPAY_KEY_SECRET"),
+      key_id: Deno.env.get("RAZORPAY_KEY_ID"),
+      key_secret: Deno.env.get("RAZORPAY_KEY_SECRET"),
     });
 
     const order = await razorpay.orders.create({
       amount,
       currency: "INR",
-      receipt,
+      receipt
     });
 
     return new Response(
@@ -36,7 +35,7 @@ Deno.serve(async (req) => {
         headers: {
           ...corsHeaders,
           "Content-Type": "application/json",
-        },
+        }
       }
     );
 
@@ -49,7 +48,7 @@ Deno.serve(async (req) => {
         headers: {
           ...corsHeaders,
           "Content-Type": "application/json",
-        },
+        }
       }
     );
 
